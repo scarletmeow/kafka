@@ -39,6 +39,7 @@ import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.protocol.types.Struct;
 import org.apache.kafka.common.record.CompressionType;
 import org.apache.kafka.common.record.MemoryRecords;
+import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.requests.ListOffsetRequest;
 import org.apache.kafka.common.requests.ListOffsetResponse;
@@ -88,6 +89,7 @@ public class FetcherTest {
     private ConsumerNetworkClient consumerClient = new ConsumerNetworkClient(client, metadata, time, 100);
 
     private MemoryRecords records = MemoryRecords.emptyRecords(ByteBuffer.allocate(1024), CompressionType.NONE);
+    private MemoryRecords nextRecords = MemoryRecords.emptyRecords(ByteBuffer.allocate(1024), CompressionType.NONE);
     private Fetcher<byte[], byte[]> fetcher = createFetcher(subscriptions, metrics);
     private Metrics fetcherMetrics = new Metrics(time);
     private Fetcher<byte[], byte[]> fetcherNoAutoReset = createFetcher(subscriptionsNoAutoReset, fetcherMetrics);
@@ -101,6 +103,10 @@ public class FetcherTest {
         records.append(2L, "key".getBytes(), "value-2".getBytes());
         records.append(3L, "key".getBytes(), "value-3".getBytes());
         records.close();
+
+        nextRecords.append(4L, "key".getBytes(), "value-4".getBytes());
+        nextRecords.append(5L, "key".getBytes(), "value-5".getBytes());
+        nextRecords.close();
     }
 
     @After
@@ -116,7 +122,7 @@ public class FetcherTest {
         subscriptions.seek(tp, 0);
 
         // normal fetch
-        fetcher.initFetches(cluster);
+        fetcher.sendFetches(cluster);
         client.prepareResponse(fetchResponse(this.records.buffer(), Errors.NONE.code(), 100L, 0));
         consumerClient.poll(0);
         records = fetcher.fetchedRecords().get(tp);
@@ -127,6 +133,52 @@ public class FetcherTest {
             assertEquals(offset, record.offset());
             offset += 1;
         }
+    }
+
+    private MockClient.RequestMatcher matchesOffset(final TopicPartition tp, final long offset) {
+        return new MockClient.RequestMatcher() {
+            @Override
+            public boolean matches(ClientRequest request) {
+                FetchRequest fetch = new FetchRequest(request.request().body());
+                return fetch.fetchData().containsKey(tp) &&
+                    fetch.fetchData().get(tp).offset == offset;
+            }
+        };
+    }
+
+    @Test
+    public void testFetchMaxPollRecords() {
+        Fetcher<byte[], byte[]> fetcher = createFetcher(2, subscriptions, new Metrics(time));
+
+        List<ConsumerRecord<byte[], byte[]>> records;
+        subscriptions.assignFromUser(Arrays.asList(tp));
+        subscriptions.seek(tp, 1);
+
+        client.prepareResponse(matchesOffset(tp, 1), fetchResponse(this.records.buffer(), Errors.NONE.code(), 100L, 0));
+        client.prepareResponse(matchesOffset(tp, 4), fetchResponse(this.nextRecords.buffer(), Errors.NONE.code(), 100L, 0));
+
+        fetcher.sendFetches(cluster);
+        consumerClient.poll(0);
+        records = fetcher.fetchedRecords().get(tp);
+        assertEquals(2, records.size());
+        assertEquals(3L, (long) subscriptions.position(tp));
+        assertEquals(1, records.get(0).offset());
+        assertEquals(2, records.get(1).offset());
+
+        fetcher.sendFetches(cluster);
+        consumerClient.poll(0);
+        records = fetcher.fetchedRecords().get(tp);
+        assertEquals(1, records.size());
+        assertEquals(4L, (long) subscriptions.position(tp));
+        assertEquals(3, records.get(0).offset());
+
+        fetcher.sendFetches(cluster);
+        consumerClient.poll(0);
+        records = fetcher.fetchedRecords().get(tp);
+        assertEquals(2, records.size());
+        assertEquals(6L, (long) subscriptions.position(tp));
+        assertEquals(4, records.get(0).offset());
+        assertEquals(5, records.get(1).offset());
     }
 
     @Test
@@ -145,7 +197,7 @@ public class FetcherTest {
         subscriptions.seek(tp, 0);
 
         // normal fetch
-        fetcher.initFetches(cluster);
+        fetcher.sendFetches(cluster);
         client.prepareResponse(fetchResponse(records.buffer(), Errors.NONE.code(), 100L, 0));
         consumerClient.poll(0);
         consumerRecords = fetcher.fetchedRecords().get(tp);
@@ -170,7 +222,7 @@ public class FetcherTest {
         records.close();
 
         // resize the limit of the buffer to pretend it is only fetch-size large
-        fetcher.initFetches(cluster);
+        fetcher.sendFetches(cluster);
         client.prepareResponse(fetchResponse((ByteBuffer) records.buffer().limit(this.fetchSize), Errors.NONE.code(), 100L, 0));
         consumerClient.poll(0);
         fetcher.fetchedRecords();
@@ -182,7 +234,7 @@ public class FetcherTest {
         subscriptions.seek(tp, 0);
 
         // resize the limit of the buffer to pretend it is only fetch-size large
-        fetcher.initFetches(cluster);
+        fetcher.sendFetches(cluster);
         client.prepareResponse(fetchResponse(this.records.buffer(), Errors.TOPIC_AUTHORIZATION_FAILED.code(), 100L, 0));
         consumerClient.poll(0);
         try {
@@ -199,7 +251,7 @@ public class FetcherTest {
         subscriptions.assignFromSubscribed(Arrays.asList(tp));
         subscriptions.seek(tp, 0);
 
-        fetcher.initFetches(cluster);
+        fetcher.sendFetches(cluster);
 
         // Now the rebalance happens and fetch positions are cleared
         subscriptions.assignFromSubscribed(Arrays.asList(tp));
@@ -215,7 +267,7 @@ public class FetcherTest {
         subscriptions.assignFromUser(Arrays.asList(tp));
         subscriptions.seek(tp, 0);
 
-        fetcher.initFetches(cluster);
+        fetcher.sendFetches(cluster);
         subscriptions.pause(tp);
 
         client.prepareResponse(fetchResponse(this.records.buffer(), Errors.NONE.code(), 100L, 0));
@@ -229,7 +281,7 @@ public class FetcherTest {
         subscriptions.seek(tp, 0);
 
         subscriptions.pause(tp);
-        fetcher.initFetches(cluster);
+        fetcher.sendFetches(cluster);
         assertTrue(client.requests().isEmpty());
     }
 
@@ -238,7 +290,7 @@ public class FetcherTest {
         subscriptions.assignFromUser(Arrays.asList(tp));
         subscriptions.seek(tp, 0);
 
-        fetcher.initFetches(cluster);
+        fetcher.sendFetches(cluster);
         client.prepareResponse(fetchResponse(this.records.buffer(), Errors.NOT_LEADER_FOR_PARTITION.code(), 100L, 0));
         consumerClient.poll(0);
         assertEquals(0, fetcher.fetchedRecords().size());
@@ -250,7 +302,7 @@ public class FetcherTest {
         subscriptions.assignFromUser(Arrays.asList(tp));
         subscriptions.seek(tp, 0);
 
-        fetcher.initFetches(cluster);
+        fetcher.sendFetches(cluster);
         client.prepareResponse(fetchResponse(this.records.buffer(), Errors.UNKNOWN_TOPIC_OR_PARTITION.code(), 100L, 0));
         consumerClient.poll(0);
         assertEquals(0, fetcher.fetchedRecords().size());
@@ -262,7 +314,7 @@ public class FetcherTest {
         subscriptions.assignFromUser(Arrays.asList(tp));
         subscriptions.seek(tp, 0);
 
-        fetcher.initFetches(cluster);
+        fetcher.sendFetches(cluster);
         client.prepareResponse(fetchResponse(this.records.buffer(), Errors.OFFSET_OUT_OF_RANGE.code(), 100L, 0));
         consumerClient.poll(0);
         assertTrue(subscriptions.isOffsetResetNeeded(tp));
@@ -275,7 +327,7 @@ public class FetcherTest {
         subscriptionsNoAutoReset.assignFromUser(Arrays.asList(tp));
         subscriptionsNoAutoReset.seek(tp, 0);
 
-        fetcherNoAutoReset.initFetches(cluster);
+        fetcherNoAutoReset.sendFetches(cluster);
         client.prepareResponse(fetchResponse(this.records.buffer(), Errors.OFFSET_OUT_OF_RANGE.code(), 100L, 0));
         consumerClient.poll(0);
         assertFalse(subscriptionsNoAutoReset.isOffsetResetNeeded(tp));
@@ -288,7 +340,7 @@ public class FetcherTest {
         subscriptionsNoAutoReset.assignFromUser(Arrays.asList(tp));
         subscriptionsNoAutoReset.seek(tp, 0);
 
-        fetcherNoAutoReset.initFetches(cluster);
+        fetcherNoAutoReset.sendFetches(cluster);
         client.prepareResponse(fetchResponse(this.records.buffer(), Errors.OFFSET_OUT_OF_RANGE.code(), 100L, 0));
         consumerClient.poll(0);
         assertFalse(subscriptionsNoAutoReset.isOffsetResetNeeded(tp));
@@ -307,7 +359,7 @@ public class FetcherTest {
         subscriptions.assignFromUser(Arrays.asList(tp));
         subscriptions.seek(tp, 0);
 
-        fetcher.initFetches(cluster);
+        fetcher.sendFetches(cluster);
         client.prepareResponse(fetchResponse(this.records.buffer(), Errors.NONE.code(), 100L, 0), true);
         consumerClient.poll(0);
         assertEquals(0, fetcher.fetchedRecords().size());
@@ -380,7 +432,7 @@ public class FetcherTest {
 
         // Next one succeeds
         client.prepareResponse(listOffsetRequestMatcher(ListOffsetRequest.LATEST_TIMESTAMP),
-                               listOffsetResponse(Errors.NONE, Arrays.asList(5L)));
+            listOffsetResponse(Errors.NONE, Arrays.asList(5L)));
         fetcher.updateFetchPositions(Collections.singleton(tp));
         assertFalse(subscriptions.isOffsetResetNeeded(tp));
         assertTrue(subscriptions.isFetchable(tp));
@@ -475,7 +527,7 @@ public class FetcherTest {
                 }
                 this.records.close();
             }
-            fetcher.initFetches(cluster);
+            fetcher.sendFetches(cluster);
             client.prepareResponse(fetchResponse(this.records.buffer(), Errors.NONE.code(), 100L, 100 * i));
             consumerClient.poll(0);
             records = fetcher.fetchedRecords().get(tp);
@@ -514,11 +566,12 @@ public class FetcherTest {
         return response.toStruct();
     }
 
-    private  Fetcher<byte[], byte[]> createFetcher(SubscriptionState subscriptions, Metrics metrics) {
+    private  Fetcher<byte[], byte[]> createFetcher(int maxPollRecords, SubscriptionState subscriptions, Metrics metrics) {
         return new Fetcher<>(consumerClient,
                 minBytes,
                 maxWaitMs,
                 fetchSize,
+                maxPollRecords,
                 true, // check crc
                 new ByteArrayDeserializer(),
                 new ByteArrayDeserializer(),
@@ -529,5 +582,9 @@ public class FetcherTest {
                 metricTags,
                 time,
                 retryBackoffMs);
+    }
+
+    private  Fetcher<byte[], byte[]> createFetcher(SubscriptionState subscriptions, Metrics metrics) {
+        return createFetcher(Integer.MAX_VALUE, subscriptions, metrics);
     }
 }

@@ -289,17 +289,8 @@ abstract class BaseConsumerTest extends IntegrationTestHarness with Logging {
   }
 
   protected def consumeAndVerifyRecords(consumer: Consumer[Array[Byte], Array[Byte]], numRecords: Int, startingOffset: Int,
-                                      startingKeyAndValueIndex: Int = 0, tp: TopicPartition = tp) {
-    val records = new ArrayList[ConsumerRecord[Array[Byte], Array[Byte]]]()
-    val maxIters = numRecords * 300
-    var iters = 0
-    while (records.size < numRecords) {
-      for (record <- consumer.poll(50).asScala)
-        records.add(record)
-      if (iters > maxIters)
-        throw new IllegalStateException("Failed to consume the expected records after " + iters + " iterations.")
-      iters += 1
-    }
+                                      startingKeyAndValueIndex: Int = 0, tp: TopicPartition = tp, maxPollRecords: Int = Int.MaxValue) {
+    val records = consumeRecords(consumer, numRecords, maxPollRecords = maxPollRecords)
     for (i <- 0 until numRecords) {
       val record = records.get(i)
       val offset = startingOffset + i
@@ -311,6 +302,25 @@ abstract class BaseConsumerTest extends IntegrationTestHarness with Logging {
       assertEquals(s"value $keyAndValueIndex", new String(record.value()))
     }
   }
+
+  protected def consumeRecords[K, V](consumer: Consumer[K, V],
+                                     numRecords: Int,
+                                     maxPollRecords: Int = Int.MaxValue): ArrayList[ConsumerRecord[K, V]] = {
+    val records = new ArrayList[ConsumerRecord[K, V]]
+    val maxIters = numRecords * 300
+    var iters = 0
+    while (records.size < numRecords) {
+      val polledRecords = consumer.poll(50).asScala
+      assertTrue(polledRecords.size <= maxPollRecords)
+      for (record <- polledRecords)
+        records.add(record)
+      if (iters > maxIters)
+        throw new IllegalStateException("Failed to consume the expected records after " + iters + " iterations.")
+      iters += 1
+    }
+    records
+  }
+
 
   protected def awaitCommitCallback(consumer: Consumer[Array[Byte], Array[Byte]], commitCallback: CountConsumerCommitCallback): Unit = {
     val startCount = commitCallback.count
