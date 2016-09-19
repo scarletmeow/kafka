@@ -17,12 +17,14 @@
 
 package kafka.message
 
-import kafka.utils.{IteratorTemplate, Logging}
+
+import kafka.utils.{CoreUtils, IteratorTemplate, Logging}
 import kafka.common.KafkaException
 
 import java.nio.ByteBuffer
 import java.nio.channels._
 import java.io._
+import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicLong
 
 object ByteBufferMessageSet {
@@ -64,34 +66,58 @@ object ByteBufferMessageSet {
     new IteratorTemplate[MessageAndOffset] {
 
       val inputStream: InputStream = new ByteBufferBackedInputStream(wrapperMessage.payload)
-      val compressed: DataInputStream = new DataInputStream(CompressionFactory(wrapperMessage.compressionCodec, inputStream))
 
-      override def makeNext(): MessageAndOffset = {
+      //val compressed: DataInputStream = new DataInputStream(CompressionFactory(wrapperMessage.compressionCodec, inputStream))
+
+      val messageAndOffsets = {
+        val compressed = try {
+          new DataInputStream(CompressionFactory(wrapperMessage.compressionCodec, inputStream))
+        } catch {
+          case ioe: IOException =>
+            throw new KafkaException(s"Failed to instantiate input stream compressed with ${wrapperMessage.compressionCodec}", ioe)
+        }
+        val innerMessageAndOffsets = new ArrayDeque[MessageAndOffset]()
         try {
-          // read the offset
-          val offset = compressed.readLong()
-          // read record size
-          val size = compressed.readInt()
-
-          if (size < Message.MinHeaderSize)
-            throw new InvalidMessageException("Message found with corrupt size (" + size + ") in deep iterator")
-
-          // read the record into an intermediate record buffer
-          // and hence has to do extra copy
-          val bufferArray = new Array[Byte](size)
-          compressed.readFully(bufferArray, 0, size)
-          val buffer = ByteBuffer.wrap(bufferArray)
-
-          val newMessage = new Message(buffer)
-
-          // the decompressed message should not be a wrapper message since we do not allow nested compression
-          new MessageAndOffset(newMessage, offset)
+          while (true) {
+            innerMessageAndOffsets.add(readMessageFromStream(compressed))
+          }
         } catch {
           case eofe: EOFException =>
-            compressed.close()
-            allDone()
-          case ioe: IOException =>
-            throw new KafkaException(ioe)
+          // we don't do anything at all here, because the finally
+          // will close the compressed input stream, and we simply
+          // want to return the innerMessageAndOffsets
+          case ioe: IOException =>  
+            throw new KafkaException(s"Error while reading message from stream compressed with ${wrapperMessage.compressionCodec}", ioe)
+        } finally {
+          CoreUtils.swallow(compressed.close())
+        }
+        innerMessageAndOffsets
+      }
+
+      private def readMessageFromStream(compressed: DataInputStream): MessageAndOffset = {
+        // read the offset
+        val offset = compressed.readLong()
+        // read record size
+        val size = compressed.readInt()
+
+        if (size < Message.MinHeaderSize) {
+          throw new InvalidMessageException("Message found with corrupt size (" + size + ") in deep iterator")
+        }
+
+        // read the record into an intermediate record buffer
+        // and hence has to do extra copy
+        val bufferArray = new Array[Byte](size);
+        compressed.readFully(bufferArray, 0, size)
+        val buffer = ByteBuffer.wrap(bufferArray)
+
+        val newMessage = new Message(buffer)
+        new MessageAndOffset(newMessage, offset)
+      }
+
+      override def makeNext(): MessageAndOffset = {
+        messageAndOffsets.pollFirst() match {
+          case null => allDone()
+          case nextMessage => nextMessage
         }
       }
     }
