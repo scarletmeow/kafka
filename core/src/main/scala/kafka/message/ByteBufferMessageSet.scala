@@ -67,7 +67,6 @@ object ByteBufferMessageSet {
 
       val inputStream: InputStream = new ByteBufferBackedInputStream(wrapperMessage.payload)
 
-      //val compressed: DataInputStream = new DataInputStream(CompressionFactory(wrapperMessage.compressionCodec, inputStream))
 
       val messageAndOffsets = {
         val compressed = try {
